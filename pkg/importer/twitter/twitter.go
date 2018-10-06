@@ -44,6 +44,7 @@ import (
 	"perkeep.org/pkg/schema/nodeattr"
 
 	"github.com/garyburd/go-oauth/oauth"
+	"github.com/gernest/mention"
 
 	"go4.org/ctxutil"
 	"go4.org/syncutil"
@@ -82,6 +83,17 @@ const (
 	//   $ pk-put attr <acct-permanode> twitterImportLikes true
 	// ... and re-do an import.
 	acctAttrImportLikes = "twitterImportLikes"
+
+	// acctAttrTagAsTwitter specifies an optional attribute for the account permanode.
+	// If set, tweets will automatically have the tag "twitter" applied when imported.
+	// use $ pk-put attr <acct-permanode> twitterTagAsTwitter true
+	acctAttrTagAsTwitter = "twitterTagAsTwitter"
+
+	// acctAttrTagWithHashtags specifies an optional attribute for the account permanode.
+	// If set, tweets will automatically have the tags from the message applied
+	// when imported.
+	// use $ pk-put attr <acct-permanode> twitterTagWithHashtags true
+	acctAttrTagWithHashtags = "twitterTagWithHashtags"
 
 	// acctAttrZipDoneVersion is updated at the end of a successful zip import and
 	// is used to determine whether the zip file needs to be re-imported in a future run.
@@ -187,6 +199,15 @@ Then you can start running the importer.
 If you want to import likes as well, please run <br>
 "pk-put attr &lt;acct-permanode&gt; twitterImportLikes true" to enable it.
 </p>
+<p>
+If you would like to tag your tweets with the hashtag from the tweet, you can turn this<br>
+by setting the twitterTagWithHashtags attribute via the UI or command line:<br>
+<pre>pk-put attr <acct-permanode> twitterTagWithHashtags true</pre><br>
+With that setting set to true you can also tag the tweets with a generic "twitter" tag<br>
+By setting twitterTagAsTwitter:<br>
+<pre>pk-put attr <acct-permanode> twitterTagAsTwitter true</pre><br>
+NB: This currently only works via API not on ZIP archive
+</p>
 `, base, base+"/callback")
 }
 
@@ -213,6 +234,7 @@ func (im *imp) Run(ctx *importer.RunContext) error {
 	acctNode := ctx.AccountNode()
 	accessToken := acctNode.Attr(importer.AcctAttrAccessToken)
 	accessSecret := acctNode.Attr(importer.AcctAttrAccessTokenSecret)
+
 	if accessToken == "" || accessSecret == "" {
 		return errors.New("access credentials not found")
 	}
@@ -241,9 +263,12 @@ func (im *imp) Run(ctx *importer.RunContext) error {
 		return errors.New("userID hasn't been set by account setup")
 	}
 
+	tagWithHashtags, _ := strconv.ParseBool(acctNode.Attr(acctAttrTagWithHashtags))
+	tagAsTwitter, _ := strconv.ParseBool(acctNode.Attr(acctAttrTagAsTwitter))
+
 	skipAPITweets, _ := strconv.ParseBool(os.Getenv("CAMLI_TWITTER_SKIP_API_IMPORT"))
 	if !skipAPITweets {
-		if err := r.importTweets(userID, userTimeLineAPIPath); err != nil {
+		if err := r.importTweets(userID, userTimeLineAPIPath, tagWithHashtags, tagAsTwitter); err != nil {
 			return err
 		}
 	}
@@ -254,7 +279,7 @@ func (im *imp) Run(ctx *importer.RunContext) error {
 	}
 	importLikes, err := strconv.ParseBool(acctNode.Attr(acctAttrImportLikes))
 	if err == nil && importLikes {
-		if err := r.importTweets(userID, userLikesAPIPath); err != nil {
+		if err := r.importTweets(userID, userLikesAPIPath, tagWithHashtags, tagAsTwitter); err != nil {
 			return err
 		}
 	}
@@ -371,7 +396,7 @@ func (r *run) doAPI(result interface{}, apiPath string, keyval ...string) error 
 // importTweets imports the tweets related to userID, through apiPath.
 // If apiPath is userTimeLineAPIPath, the tweets and retweets posted by userID are imported.
 // If apiPath is userLikesAPIPath, the tweets liked by userID are imported.
-func (r *run) importTweets(userID string, apiPath string) error {
+func (r *run) importTweets(userID string, apiPath string, importHashtags bool, tagAsTwitter bool) error {
 	maxId := ""
 	continueRequests := true
 
@@ -440,7 +465,7 @@ func (r *run) importTweets(userID string, apiPath string) error {
 			gate.Start()
 			grp.Go(func() error {
 				defer gate.Done()
-				dup, err := r.importTweet(tweetsNode, tweet, true)
+				dup, err := r.importTweet(tweetsNode, tweet, true, importHashtags, tagAsTwitter)
 				if !dup {
 					allDupMu.Lock()
 					allDups = false
@@ -516,7 +541,7 @@ func (r *run) importTweetsFromZip(userID string, zr *zip.Reader) error {
 			gate.Start()
 			grp.Go(func() error {
 				defer gate.Done()
-				_, err := r.importTweet(tweetsNode, tweet, false)
+				_, err := r.importTweet(tweetsNode, tweet, false, false, false)
 				return err
 			})
 		}
@@ -540,7 +565,7 @@ func timeParseFirstFormat(timeStr string, format ...string) (t time.Time, err er
 }
 
 // viaAPI is true if it came via the REST API, or false if it came via a zip file.
-func (r *run) importTweet(parent *importer.Object, tweet tweetItem, viaAPI bool) (dup bool, err error) {
+func (r *run) importTweet(parent *importer.Object, tweet tweetItem, viaAPI bool, importHashtags bool, tagAsTwitter bool) (dup bool, err error) {
 	select {
 	case <-r.Context().Done():
 		r.errorf("Twitter importer: interrupted")
@@ -585,6 +610,7 @@ func (r *run) importTweet(parent *importer.Object, tweet tweetItem, viaAPI bool)
 		nodeattr.Content, tweet.Text(),
 		nodeattr.URL, url,
 	}
+
 	if lat, long, ok := tweet.LatLong(); ok {
 		attrs = append(attrs,
 			nodeattr.Latitude, fmt.Sprint(lat),
@@ -641,6 +667,26 @@ func (r *run) importTweet(parent *importer.Object, tweet tweetItem, viaAPI bool)
 	if err == nil && changes {
 		log.Printf("twitter: imported tweet %s", url)
 	}
+
+	// ---------------------------------------------------------
+	// This code tags permanodes with the tags from the twitter messages
+	// Will be optional via..
+	if importHashtags {
+		tags := mention.GetTagsAsUniqueStrings('#', tweet.Text())
+		for i, v := range tags {
+			tags[i] = strings.ToLower(v)
+		}
+
+		if tagAsTwitter {
+			tags = append(tags, "twitter")
+		}
+
+		if err := tweetNode.SetAttrValues("tag", tags); err != nil {
+			return false, err
+		}
+	}
+	// --------------------------------------------------------
+
 	return !changes, err
 }
 
